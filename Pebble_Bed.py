@@ -11,11 +11,11 @@ from copy import deepcopy
 from glob import glob
 import matplotlib.image as mpimg
 import os
-
+import difflib
 #%matplotlib widget
 
 class Pebble_bed:
-    
+
     #### GENERAL ####
 
     def __init__(self, verbose=True, level=0, log_delim='  '):
@@ -32,24 +32,30 @@ class Pebble_bed:
 
     def read_file(self, pbed_file_path, *, calculate_dist=True, calculate_radial_dist=True, radial_center=[0,0], verbose=True, level=0, log_delim='  '):
         log_print(f'Reading pbed file from {pbed_file_path}', verbose, level, log_delim)
-        data = pd.read_csv(pbed_file_path, delim_whitespace=True, header=None, names=["x", "y", "z", "r", "uni"])       
+        data = pd.read_csv(pbed_file_path, delim_whitespace=True, header=None, names=["x", "y", "z", "r", "uni"])
         self.pbed_path = pbed_file_path
         self.data = data
         self.data['id'] = np.array(self.data.index)
         self.process_data(calculate_dist, calculate_radial_dist, radial_center, verbose=verbose, level=level+1, log_delim=log_delim)
         self.read_files.append(pbed_file_path)
         log_print(f'Done.', verbose, level, log_delim, end_block=True)
-        return data    
+        return data
 
-    def read_table(self, data, universes_included=False, calculate_dist=True, calculate_radial_dist=True, radial_center=[0,0], verbose=True, level=0, log_delim='  '):
+    def read_datafile(self, data_file_path, sep=',', calculate_dist=True, calculate_radial_dist=True, radial_center=[0,0], verbose=True, level=0, log_delim='  '):
+        log_print(f'Reading data from data file {data_file_path}', verbose, level, log_delim)
+        self.data = pd.read_csv(data_file_path, sep=sep)
+        self.process_data(calculate_dist, calculate_radial_dist, radial_center, verbose=verbose, level=level+1, log_delim=log_delim)
+        log_print(f'Done.', verbose, level, log_delim, end_block=True)
+
+    def read_pos_table(self, table, universes_included=False, calculate_dist=True, calculate_radial_dist=True, radial_center=[0,0], verbose=True, level=0, log_delim='  '):
         log_print(f'Generating data from table containing xyzr', verbose, level, log_delim)
-        if isinstance(data, pd.DataFrame):
-            self.data = data
+        if isinstance(table, pd.DataFrame):
+            self.data = table
         else:
             if universes_included:
-                self.data = pd.DataFrame(data, columns=['x', 'y', 'z', 'r', 'uni'])
+                self.data = pd.DataFrame(table, columns=['x', 'y', 'z', 'r', 'uni'])
             else:
-                self.data = pd.DataFrame(data, columns=['x', 'y', 'z', 'r'])
+                self.data = pd.DataFrame(table, columns=['x', 'y', 'z', 'r'])
         self.data['id'] = np.array(self.data.index)
         self.process_data(calculate_dist, calculate_radial_dist, radial_center, verbose=verbose, level=level+1, log_delim=log_delim)
         log_print(f'Done.', verbose, level, log_delim, end_block=True)
@@ -104,7 +110,7 @@ class Pebble_bed:
     def is_ghost(self, index='all'):
         if isinstance(index, str) and index=='all':
             return np.logical_or(self.data['r'] == 0, np.isnan(self.data['r']))
-        else:    
+        else:
             return np.logical_or(self.data.loc[index, 'r'] == 0, np.isnan(self.data.loc[index, 'r']))
 
     #### PROCESSING DATA ####
@@ -120,10 +126,46 @@ class Pebble_bed:
 
         if isinstance(indices, (list, tuple, np.ndarray)) or isinstance(indices, int):
            subpbed.data = subpbed.data.loc[indices]
-        
+
         return subpbed
 
     #### POST PROCESSING ####
+
+    def extract_res(self, res_file_path, parameter, infer_if_incorrect=True, which_rows='all', which_columns='all'):
+        res_reader = serpentTools.read(res_file_path)
+        parameter = find_matching(parameter, list(res_reader.resdata.keys()), infer_if_incorrect=infer_if_incorrect, lower_ok=True, cutoff=0.4)
+        array = res_reader.resdata[parameter]
+        if isinstance(which_rows, str) and which_rows == 'all':
+            which_rows = [i for i in range(array.shape[0])]
+        array = array[which_rows, :]
+        if isinstance(which_columns, str) and which_columns == 'all':
+            which_columns = [i for i in range(array.shape[1])]
+        array = array[:, which_columns]
+        if not hasattr(self, 'results'):
+            self.results = dict()
+        self.results[parameter] = array
+        return array
+
+    def distribution(self, name, bins=10, ignore_ghosts=True, normalized=False, weights=None, cumulative=False):
+        if ignore_ghosts:
+            array = self.data.loc[~self.is_ghost(), name]
+        else:
+            array = self.data[name]
+
+        if isinstance(weights, type(None)):
+            weights=np.ones(len(array))
+        elif isinstance(weights, (int,float)):
+            weights= np.ones(len(array))*weights
+
+        cnt, vals = np.histogram(array, bins=bins, weights=weights, density=normalized)
+        if cumulative:
+            cnt = np.multiply(np.cumsum(cnt), np.diff(vals))
+        return cnt, vals
+
+    def summarize_field(self, names='all'):
+        if isinstance(names, str) and names == 'all':
+            names = self.data.columns
+        return self.data[names].describe()
 
     def add_field(self, name, array, err=False, verbose=True, level=0, log_delim='  '):
         log_print(f'Adding field {name} manually to data (N={len(array)})', verbose, level, log_delim)
@@ -136,7 +178,7 @@ class Pebble_bed:
         else:
             self.fields_err[name] = array
             if len(array) == len(self.data):
-                self.data[name+'_err'] = self.fields_err[name]  
+                self.data[name+'_err'] = self.fields_err[name]
         log_print(f'Done.', verbose, level, log_delim, end_block=True)
 
     def read_detector(self, det_file_path, which_dets='all', verbose=True, level=0, log_delim='  '):
@@ -172,7 +214,7 @@ class Pebble_bed:
                     name_grid = list(grids)[0]
                     for i_grid in range(grids[name_grid].shape[0]):
                         self.data[f'{det_name}_{name_grid}{i_grid}'] = self.fields[det_name][i_grid, :]
-                        self.data[f'{det_name}_{name_grid}{i_grid}_err'] = self.fields_err[det_name][i_grid, :]                        
+                        self.data[f'{det_name}_{name_grid}{i_grid}_err'] = self.fields_err[det_name][i_grid, :]
         self.read_files.append(det_file_path)
         log_print(f'Added following detectors: {which_dets}', verbose, level+1, log_delim)
         log_print(f'Done.', verbose, level, log_delim, end_block=True)
@@ -186,7 +228,7 @@ class Pebble_bed:
             if dep_file_path[-2:] != '.m':
                 dep_file_path += '.m'
             dep_file_path = [dep_file_path]
-        
+
 
         log_print(f'Reading dep file from {dep_file_path}', verbose, level, log_delim)
         dep_reader = serpentTools.read(dep_file_path[0], reader='dep')
@@ -197,7 +239,7 @@ class Pebble_bed:
 
         if not hasattr(self, 'fields'):
             self.fields = dict()
-            
+
         if fields=='all':
             fields = [i for i in list(dep_reader.materials.values())[0].data.keys()]
         if steps=='all':
@@ -221,9 +263,9 @@ class Pebble_bed:
                 if isinstance(dep_reader.materials[f'{material_name}z1'].data[field_name][0], (tuple, list, np.ndarray)):
                     for name in nuc_names:
                         self.fields[f'{name}_{field_name}_{step}'] = np.empty(len(self.data))
-                    nuc_wise.append(True)      
+                    nuc_wise.append(True)
                 else:
-                    self.fields[f'{field_name}_{step}'] = np.empty(len(self.data))      
+                    self.fields[f'{field_name}_{step}'] = np.empty(len(self.data))
                     nuc_wise.append(False)
         for step in steps:
             for i in range(1, len(self.data)+1):
@@ -232,7 +274,7 @@ class Pebble_bed:
                         for i_name, name in enumerate(nuc_names):
                             self.fields[f'{name}_{field_name}_{step}'][i-1] = dep_reader.materials[f'{material_name}z{i}'].data[field_name][step][i_name]
                     else:
-                        self.fields[f'{field_name}_{step}'][i-1] = dep_reader.materials[f'{material_name}z{i}'].data[field_name][step]  
+                        self.fields[f'{field_name}_{step}'][i-1] = dep_reader.materials[f'{material_name}z{i}'].data[field_name][step]
 
             for i_field, field_name in enumerate(fields):
                 if nuc_wise[i_field]:
@@ -281,19 +323,19 @@ class Pebble_bed:
         dir_id = str(dir_id)
 
         if isinstance(val, str) and val == 'middle':
-            val = np.nanmean(self.filter_ghosts().data[['x','y','z'][dir_id]])
+            val = np.nanmean(self.filter_ghosts().data[['x','y','z'][int(dir_id)]])
 
-        log_print(f'Clipping pbed in direction {dir_id} at values {sdir} {val:.4E}', verbose, level, log_delim)
+        #log_print(f'Clipping pbed in direction {dir_id} at values {sdir} {val:.4E}', verbose, level, log_delim)
 
         if dir_id.lower() in ["x", "y", "z"]:
             dir_id = ["x", "y", "z"].index(dir_id.lower())
-            sub_pbed.data =  self.data[self.data[["x", "y", "z"][dir_id]]*direction >= val*direction]
+            sub_pbed.data =  self.data[self.data[["x", "y", "z"][int(dir_id)]]*direction >= val*direction]
         elif dir_id == '4' or dir_id.lower() in ['dist', 'd']:
             sub_pbed.data =   self.data[self.data.dist*direction >= val*direction]
         elif dir_id == '5' or dir_id.lower() in ['r_dist', 'rdist', 'r']:
-            sub_pbed.data = self.data[self.data.r_dist*direction >= val*direction]  
+            sub_pbed.data = self.data[self.data.r_dist*direction >= val*direction]
         else:
-            sub_pbed.data =  self.data[self.data[["x", "y", "z"][dir_id]]*direction >= val*direction]
+            sub_pbed.data =  self.data[self.data[["x", "y", "z"][int(dir_id)]]*direction >= val*direction]
 
         log_print(f'Done.', verbose, level, log_delim, end_block=True)
         return sub_pbed
@@ -305,17 +347,310 @@ class Pebble_bed:
         if dir_id.lower() in ["x", "y", "z"]:
             dir_id = ["x", "y", "z"].index(dir_id.lower())
         dir_id = int(dir_id)
-        
+
         log_print(f'Projecting pbed in direction {dir_id} at value {val:.4E}', verbose, level, log_delim)
         rel_pos = val - self.data[["x", "y", "z"][dir_id]]
         tmp = self.data.r**2 - rel_pos**2
         r_projected = np.ones_like(tmp)*np.nan
         r_projected[tmp >= 0] = tmp[tmp >= 0]**0.5
-        
+
         log_print(f'Done.', verbose, level, log_delim, end_block=True)
         return r_projected
 
-    def plot2D(self, field='id', dir_id=0, val='middle', colormap='turbo', xlim=None, ylim=None, tol=None, equal=True, field_title=None, clim=None, superimpose_Serpent=False, Serpent_xsize=None, Serpent_ysize=None, Serpent_geom_path=None, fig_size=None, new_fig=True, save_fig=False, fig_folder='./', fig_name=None, fig_suffix='', fig_dpi=600, plot_title=None, verbose=True, level=0, log_delim='  '):
+    def plot_res(self, parameter, infer_if_incorrect=True, which_rows='all', which_columns='all', which_columns_errors=None, res_file_path=None, use_time=True, ylabel=None, plot_labels=None, new_fig=True, xlim=None, ylim=None, equal=False, fig_size=None, save_fig=False, fig_folder='./', fig_name=None, fig_suffix='', fig_dpi=600, plot_title=None, verbose=True, level=0, log_delim='  '):
+        if not hasattr(self, 'results'):
+            self.results = dict()
+
+        tmp = find_matching(parameter, self.results.keys())
+        if isinstance(tmp, type(None)):
+            if isinstance(res_file_path, type(None)):
+                raise Exception(f'{parameter} not found in Pebble Bed results, please put a res_file_path')
+            array = self.extract_res(res_file_path, parameter, infer_if_incorrect, which_rows, which_columns)
+        else:
+            array = self.results[tmp]
+        if use_time:
+            x = self.extract_res(res_file_path, 'burnDays', which_rows=which_rows, which_columns=0)
+            xlabel = 'Time [EPFD]'
+        else:
+            x = self.extract_res(res_file_path, 'burnStep', which_rows=which_rows, which_columns=0)
+            xlabel = 'Step #'
+
+        if new_fig:
+            if not isinstance(fig_size, type(None)):
+                plt.figure(figsize=fig_size)
+            else:
+                plt.figure()
+
+        ax = plt.gca()
+        if isinstance(which_columns_errors, type(None)):
+            plt.plot(x, array, label=plot_labels)
+        else:
+            array_err = self.extract_res(res_file_path, parameter, infer_if_incorrect, which_rows=which_rows, which_columns=which_columns_errors)
+            errorbar(x, array, yerr=array_err, label=plot_labels, steps=True)
+        plt.xlabel(xlabel)
+        if isinstance(ylabel, type(None)):
+            plt.ylabel(parameter)
+        else:
+            plt.ylabel(ylabel)
+        plt.legend()
+
+        if not isinstance(xlim, type(None)):
+            ax.set_xlim(xlim)
+        if not isinstance(ylim, type(None)):
+            ax.set_ylim(ylim)
+        if isinstance(plot_title, type(None)):
+            plt.title(f"Evolution of {parameter}")
+        else:
+            plt.title(plot_title)
+        ax.autoscale_view()
+        if equal:
+            ax.set_aspect("equal", adjustable="box")
+        plt.grid()
+        ax.set_axisbelow(True)
+
+        plt.tight_layout()
+
+        if save_fig:
+            if isinstance(fig_name, type(None)):
+                fig_path = f'{fig_folder}/res_plot_{parameter}{fig_suffix}.png'
+            else:
+                fig_path = f'{fig_folder}/{fig_name}{fig_suffix}.png'
+            log_print(f'Saving figure in {fig_path}', verbose, level+1, log_delim)
+            plt.savefig(fig_path, dpi=fig_dpi, bbox_inches='tight')
+
+        log_print(f'Done.', verbose, level, log_delim, end_block=True)
+        return ax
+
+    def plot_distribution(self, parameter, bins=10, ignore_ghosts=True, normalized=False, weights=None, cumulative=False, xlabel=None, ylabel=None, plot_labels=None, alpha=0.6, new_fig=True, xlim=None, ylim=None, equal=False, colormap='turbo', fig_size=None, save_fig=False, fig_folder='./', fig_name=None, fig_suffix='', fig_dpi=600, plot_title=None, verbose=True, level=0, log_delim='  '):
+
+        cnt, vals = self.distribution(parameter, bins=bins, ignore_ghosts=ignore_ghosts, normalized=normalized, weights=weights, cumulative=cumulative)
+        if cumulative:
+            slopes = np.divide(np.diff(np.concatenate(([0],cnt))),np.diff(vals))
+            cmap = cm.get_cmap(colormap)
+            norm = Normalize(vmin = np.min(slopes), vmax = np.max(slopes))
+            normalized_values = norm(slopes)
+            colors = cmap(normalized_values)
+        else:
+            colors=None
+
+        if new_fig:
+            if not isinstance(fig_size, type(None)):
+                plt.figure(figsize=fig_size)
+            else:
+                plt.figure()
+
+        ax = plt.gca()
+        if normalized:
+            cnt*=100
+
+        plt.bar(vals[:-1], cnt, width=np.diff(vals), color=colors, alpha=alpha, label=plot_labels)
+        if isinstance(xlabel, type(None)):
+            plt.xlabel(parameter)
+        else:
+            plt.xlabel(xlabel)
+        if isinstance(ylabel, type(None)):
+            ylabel = parameter
+        if cumulative:
+            ylabel = f'Cumulative {ylabel}'
+        if normalized:
+            ylabel += ' [%]'
+
+        plt.ylabel(ylabel)
+
+        if not isinstance(xlim, type(None)):
+            ax.set_xlim(xlim)
+        if not isinstance(ylim, type(None)):
+            ax.set_ylim(ylim)
+        if isinstance(plot_title, type(None)):
+            plt.title(f"Distribution of {parameter}")
+        else:
+            plt.title(plot_title)
+        ax.autoscale_view()
+        if equal:
+            ax.set_aspect("equal", adjustable="box")
+        plt.grid()
+        ax.set_axisbelow(True)
+
+        plt.tight_layout()
+
+        if save_fig:
+            if isinstance(fig_name, type(None)):
+                fig_path = f'{fig_folder}/dist_plot_{parameter}{fig_suffix}.png'
+            else:
+                fig_path = f'{fig_folder}/{fig_name}{fig_suffix}.png'
+            log_print(f'Saving figure in {fig_path}', verbose, level+1, log_delim)
+            plt.savefig(fig_path, dpi=fig_dpi, bbox_inches='tight')
+
+        log_print(f'Done.', verbose, level, log_delim, end_block=True)
+        return ax
+
+    def plot1D_sum(self, field, fieldx='r_dist', bins=20, error_field=None, absolute_error=False, cumulative=False, ignore_ghosts=True, xlim=None, ylim=None, xlabel=None, ylabel=None, xcut=None, ycut=None, equal=False, field_title=None, fig_size=None, new_fig=True, save_fig=False, fig_folder='./', fig_name=None, fig_suffix='', fig_dpi=600, plot_title=None, verbose=True, level=0, log_delim='  '):
+        if isinstance(field, (tuple, list, np.ndarray, pd.DataFrame, pd.Series)):
+            log_print(f'1D plotting pbed of user-defined field vs {fieldx}', verbose, level, log_delim)
+            if isinstance(field_title, type(None)):
+                self.data['user-defined'] = np.array(field)
+                field = 'user-defined'
+                field_title = field
+            else:
+                self.data[field_title] = np.array(field)
+                field = field_title
+
+        else:
+            if isinstance(field_title, type(None)):
+                field_title = field
+            log_print(f'1D plotting pbed of field "{field}" vs {fieldx}', verbose, level, log_delim)
+
+
+        if ignore_ghosts:
+            data = self.data[~self.is_ghost()]
+        else:
+            data = self.data
+        if not isinstance(xcut, type(None)):
+            data = data.loc[data[fieldx].between(xcut[0], xcut[1])]
+        if not isinstance(ycut, type(None)):
+            data = data.loc[data[field].between(ycut[0], ycut[1])]
+        cut_data, bin_limits = pd.cut(data[fieldx], bins=bins, retbins=True)
+        bin_middle = (bin_limits[1:]+bin_limits[:-1])/2
+        grouped_data = data.groupby(cut_data)
+        sum_array = grouped_data[field].sum()
+        if cumulative:
+            sum_array = pd.Series(np.cumsum(list(sum_array)))
+        if new_fig:
+            if not isinstance(fig_size, type(None)):
+                plt.figure(figsize=fig_size)
+            else:
+                plt.figure()
+
+        ax = plt.gca()
+        if not isinstance(error_field, type(None)):
+            err_array = [np.sqrt(np.sum(np.power(i, 2))) for i in np.array(grouped_data[error_field].apply(list))]
+            if not absolute_error:
+                err_array *= sum_array.values
+            errorbar(bin_limits, np.concatenate(([sum_array.iloc[0]], sum_array)), np.concatenate(([err_array[0]], err_array)), steps=True)
+        else:
+            plt.plot(bin_limits, np.concatenate(([sum_array.iloc[0]], sum_array)), drawstyle='steps-pre')
+
+        if not isinstance(xlabel, type(None)):
+            plt.xlabel(xlabel)
+        else:
+            plt.xlabel(fieldx)
+        if not isinstance(ylabel, type(None)):
+            plt.ylabel(ylabel)
+        else:
+            plt.ylabel(field)
+        if not isinstance(xlim, type(None)):
+            ax.set_xlim(xlim)
+        if not isinstance(ylim, type(None)):
+            ax.set_ylim(ylim)
+        if isinstance(plot_title, type(None)):
+            plt.title(f"{field} vs {fieldx}")
+        else:
+            plt.title(plot_title)
+        ax.autoscale_view()
+        if equal:
+            ax.set_aspect("equal", adjustable="box")
+        plt.grid()
+        ax.set_axisbelow(True)
+
+        plt.tight_layout()
+
+        if save_fig:
+            if isinstance(fig_name, type(None)):
+                fig_path = f'{fig_folder}/1D_sum_plot_{field}_vs_{fieldx}{fig_suffix}.png'
+            else:
+                fig_path = f'{fig_folder}/{fig_name}{fig_suffix}.png'
+            log_print(f'Saving figure in {fig_path}', verbose, level+1, log_delim)
+            plt.savefig(fig_path, dpi=fig_dpi, bbox_inches='tight')
+
+        log_print(f'Done.', verbose, level, log_delim, end_block=True)
+        return ax
+
+
+    def plot1D_mean(self, field, fieldx='r_dist', bins=20, error_field=None, absolute_error=False, plot_std=True, ignore_ghosts=True, xlim=None, ylim=None, xlabel=None, ylabel=None, xcut=None, ycut=None, equal=False, field_title=None, fig_size=None, new_fig=True, save_fig=False, fig_folder='./', fig_name=None, fig_suffix='', fig_dpi=600, plot_title=None, verbose=True, level=0, log_delim='  '):
+        if isinstance(field, (tuple, list, np.ndarray, pd.DataFrame, pd.Series)):
+            log_print(f'1D plotting pbed of user-defined field vs {fieldx}', verbose, level, log_delim)
+            if isinstance(field_title, type(None)):
+                self.data['user-defined'] = np.array(field)
+                field = 'user-defined'
+                field_title = field
+            else:
+                self.data[field_title] = np.array(field)
+                field = field_title
+
+        else:
+            if isinstance(field_title, type(None)):
+                field_title = field
+            log_print(f'1D plotting pbed of field "{field}" vs {fieldx}', verbose, level, log_delim)
+
+
+        if ignore_ghosts:
+            data = self.data[~self.is_ghost()]
+        else:
+            data = self.data
+        if not isinstance(xcut, type(None)):
+            data = data.loc[data[fieldx].between(xcut[0], xcut[1])]
+        if not isinstance(ycut, type(None)):
+            data = data.loc[data[field].between(ycut[0], ycut[1])]
+        cut_data, bin_limits = pd.cut(data[fieldx], bins=bins, retbins=True)
+        bin_middle = (bin_limits[1:]+bin_limits[:-1])/2
+        grouped_data = data.groupby(cut_data)
+        mean_array = grouped_data[field].mean()
+
+        if new_fig:
+            if not isinstance(fig_size, type(None)):
+                plt.figure(figsize=fig_size)
+            else:
+                plt.figure()
+
+        ax = plt.gca()
+        if not isinstance(error_field, type(None)):
+            mean_err_array = grouped_data[error_field].mean()
+            if not absolute_error:
+                mean_err_array *= mean_array.values
+            errorbar(bin_limits, np.concatenate(([mean_array.iloc[0]], mean_array)), np.concatenate(([mean_err_array.iloc[0]], mean_err_array)), steps=True)
+        elif plot_std:
+            std_array = grouped_data[field].std()
+            errorbar(bin_limits, np.concatenate(([mean_array.iloc[0]], mean_array)), np.concatenate(([std_array.iloc[0]], std_array)), steps=True)
+        else:
+            plt.plot(bin_limits, np.concatenate(([mean_array.iloc[0]], mean_array)), drawstyle='steps-pre')
+
+        if not isinstance(xlabel, type(None)):
+            plt.xlabel(xlabel)
+        else:
+            plt.xlabel(fieldx)
+        if not isinstance(ylabel, type(None)):
+            plt.ylabel(ylabel)
+        else:
+            plt.ylabel(field)
+        if not isinstance(xlim, type(None)):
+            ax.set_xlim(xlim)
+        if not isinstance(ylim, type(None)):
+            ax.set_ylim(ylim)
+        if isinstance(plot_title, type(None)):
+            plt.title(f"{field} vs {fieldx}")
+        else:
+            plt.title(plot_title)
+        ax.autoscale_view()
+        if equal:
+            ax.set_aspect("equal", adjustable="box")
+        plt.grid()
+        ax.set_axisbelow(True)
+
+        plt.tight_layout()
+
+        if save_fig:
+            if isinstance(fig_name, type(None)):
+                fig_path = f'{fig_folder}/1D_mean_plot_{field}_vs_{fieldx}{fig_suffix}.png'
+            else:
+                fig_path = f'{fig_folder}/{fig_name}{fig_suffix}.png'
+            log_print(f'Saving figure in {fig_path}', verbose, level+1, log_delim)
+            plt.savefig(fig_path, dpi=fig_dpi, bbox_inches='tight')
+
+        log_print(f'Done.', verbose, level, log_delim, end_block=True)
+        return ax
+
+
+    def plot2D(self, field='id', dir_id=0, val='middle', colormap='turbo', xlim=None, ylim=None, tol=None, equal=True, field_title=None, clim=None, translation=None, superimpose_Serpent=False, Serpent_xsize=None, Serpent_ysize=None, Serpent_geom_path=None, fig_size=None, new_fig=True, save_fig=False, fig_folder='./', fig_name=None, fig_suffix='', fig_dpi=600, plot_title=None, verbose=True, level=0, log_delim='  '):
         dir_id = str(dir_id)
         if dir_id == '0' or dir_id.lower() == 'x':
             xdir = 1
@@ -329,7 +664,7 @@ class Pebble_bed:
             xdir = 0
             ydir = 1
             dir_id = 2
-        
+
         if isinstance(val, str) and val == 'middle':
             val = np.nanmean(self.filter_ghosts().data[['x','y','z'][dir_id]])
 
@@ -347,8 +682,8 @@ class Pebble_bed:
             if isinstance(field_title, type(None)):
                 field_title = field
             log_print(f'2D plotting pbed in direction {dir_id} at value {val:.4E}, showing field {field}', verbose, level, log_delim)
-        
-        dir_id = int(dir_id)        
+
+        dir_id = int(dir_id)
         if isinstance(tol, type(None)):
             sub_pbed = self.slice(dir_id, val, verbose=verbose, level=level+1, log_delim=log_delim)
             r = sub_pbed.projection(dir_id, val, verbose=verbose, level=level+1, log_delim=log_delim)
@@ -361,20 +696,24 @@ class Pebble_bed:
         x = np.array(data[["x", "y", "z"][xdir]])
         y = np.array(data[["x", "y", "z"][ydir]])
 
+        if not isinstance(translation, type(None)):
+            x += translation[0]
+            y += translation[1]
+
         patches = []
         for i in range(len(data)):
             circle = Circle((x[i], y[i]), r[i])
             patches.append(circle)
-        
+
         colors = np.array(data[field])
 
         if isinstance(clim, type(None)):
-            clim = [data[field].min(), data[field].max()]  
+            clim = [data[field].min(), data[field].max()]
 
         p = PatchCollection(patches, cmap=colormap)
         p.set_array(colors)
         p.set_clim(clim)
-    
+
         if new_fig:
             if not isinstance(fig_size, type(None)):
                 plt.figure(figsize=fig_size)
@@ -414,7 +753,7 @@ class Pebble_bed:
         log_print(f'Done.', verbose, level, log_delim, end_block=True)
         return ax
 
-    def plot3D(self, field='id', colormap='turbo', view=None, xlim=None, ylim=None, zlim=None, sample_fraction=None, fast=False, force_slow=False, scatter_size=10, alpha=1, show_ghosts=False, field_title=None, clim=None, equal=True, fig_size=None, new_fig=True, save_fig=False, fig_folder='./', fig_name=None, fig_suffix='', fig_dpi=600, verbose=True, level=0, log_delim='  '):
+    def plot3D(self, field='id', colormap='turbo', view=None, xlim=None, ylim=None, zlim=None, translation=None, sample_fraction=None, fast=False, force_slow=False, scatter_size=10, alpha=1, show_ghosts=False, field_title=None, clim=None, equal=True, fig_size=None, new_fig=True, save_fig=False, fig_folder='./', fig_name=None, fig_suffix='', fig_dpi=600, verbose=True, level=0, log_delim='  '):
         lim_fast = 1000
 
         data = self.data[self.data.r != 0]
@@ -454,9 +793,14 @@ class Pebble_bed:
             fast = True
             if isinstance(scatter_size, type(None)):
                 raise Exception('Since the number of elements is too high, plot3D switched to scatter. Please put a size to elements, with scatter_size')
-        
+
         if force_slow and len(data) > lim_fast:
             log_print(f'WARNING: Many elements to plot ({len(data)}>{lim_fast}), might take a while', verbose, level+1, log_delim)
+
+        if not isinstance(translation, type(None)):
+            data.x += translation[0]
+            data.y += translation[1]
+            data.z += translation[2]
 
         if not fast:
             values =  data[field]
@@ -475,9 +819,9 @@ class Pebble_bed:
                 p = ax.plot_surface(x+row.x, y+row.y, z+row.z, color=colors[i_row], shade=False, alpha=alpha, zorder=1)
                 i_row += 1
             cb = plt.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), label=field_title, orientation="horizontal") # shrink=0.5
-            
+
         else:
-            if isinstance(scatter_size, type(None)):        
+            if isinstance(scatter_size, type(None)):
                 raise Exception(f'Fast mode, needing manual parameter for scatter size')
 
             p = ax.scatter3D(
@@ -521,17 +865,17 @@ class Pebble_bed:
                 fig_path = f'{fig_folder}/{fig_name}{fig_suffix}.png'
             log_print(f'Saving figure in {fig_path}', verbose, level+1, log_delim)
             plt.savefig(fig_path, dpi=fig_dpi, bbox_inches='tight')
-        
+
         log_print(f'Done.', verbose, level, log_delim, end_block=True)
-        
+
         return ax
 
-    def plot_summary(self, field='id', colormap='turbo', view=None, xlim=None, ylim=None, zlim=None, sample_fraction=None, fast=False, force_slow=False, scatter_size=10, alpha=1, field_title=None, clim=None, superimpose_Serpent=False, Serpent_xsize=None, Serpent_ysize=None, Serpent_zsize=None, Serpent_paths_dirxyz = [None, None, None], save_fig=False, fig_size=None, fig_folder='./', fig_name=None, fig_suffix='', fig_dpi=600, verbose=True, level=0, log_delim='  '):
+    def plot_summary(self, field='id', colormap='turbo', view=None, xlim=None, ylim=None, zlim=None, translation=None, sample_fraction=None, fast=False, force_slow=False, scatter_size=10, alpha=1, field_title=None, clim=None, superimpose_Serpent=False, Serpent_xsize=None, Serpent_ysize=None, Serpent_zsize=None, Serpent_paths_dirxyz = [None, None, None], save_fig=False, fig_size=None, fig_folder='./', fig_name=None, fig_suffix='', fig_dpi=600, verbose=True, level=0, log_delim='  '):
         if not isinstance(fig_size, type(None)):
             fig = plt.figure(figsize=fig_size)
         else:
             fig = plt.figure()
-        
+
         log_print(f'Plotting of Pebble Bed', verbose, level, log_delim)
         if superimpose_Serpent:
             valx = np.mean(Serpent_xsize)
@@ -541,16 +885,18 @@ class Pebble_bed:
             valx = 'middle'
             valy = 'middle'
             valz = 'middle'
+        if isinstance(clim, type(None)):
+            clim = [np.min(self.data[field]), np.max(self.data[field])]
 
         ax1=fig.add_subplot(2,2,1)
-        self.plot2D(field, dir_id=0, val=valx, plot_title='YZ', superimpose_Serpent=superimpose_Serpent, Serpent_xsize=Serpent_ysize, Serpent_ysize=Serpent_zsize, Serpent_geom_path=Serpent_paths_dirxyz[0], new_fig=False, xlim=xlim, ylim=ylim, clim=clim, field_title=field_title, colormap=colormap, verbose=verbose, level=level+1, log_delim=log_delim)
+        self.plot2D(field, dir_id=2, val=valz, plot_title='XY', translation=translation, superimpose_Serpent=superimpose_Serpent, Serpent_xsize=Serpent_xsize, Serpent_ysize=Serpent_ysize, Serpent_geom_path=Serpent_paths_dirxyz[2], new_fig=False, xlim=ylim, ylim=zlim, clim=clim, field_title=field_title, colormap=colormap, verbose=verbose, level=level+1, log_delim=log_delim)
         ax2=fig.add_subplot(2,2,2)
-        self.plot2D(field, dir_id=1, val=valy, plot_title='XZ', superimpose_Serpent=superimpose_Serpent, Serpent_xsize=Serpent_xsize, Serpent_ysize=Serpent_zsize, Serpent_geom_path=Serpent_paths_dirxyz[1], new_fig=False, xlim=xlim, ylim=ylim, clim=clim, field_title=field_title, colormap=colormap, verbose=verbose, level=level+1, log_delim=log_delim)
+        self.plot2D(field, dir_id=1, val=valy, plot_title='XZ', translation=translation, superimpose_Serpent=superimpose_Serpent, Serpent_xsize=Serpent_xsize, Serpent_ysize=Serpent_zsize, Serpent_geom_path=Serpent_paths_dirxyz[1], new_fig=False, xlim=xlim, ylim=zlim, clim=clim, field_title=field_title, colormap=colormap, verbose=verbose, level=level+1, log_delim=log_delim)
         ax3=fig.add_subplot(2,2,3)
-        self.plot2D(field, dir_id=2, val=valz, plot_title='XY', superimpose_Serpent=superimpose_Serpent, Serpent_xsize=Serpent_xsize, Serpent_ysize=Serpent_ysize, Serpent_geom_path=Serpent_paths_dirxyz[2], new_fig=False, xlim=xlim, ylim=ylim, clim=clim, field_title=field_title, colormap=colormap, verbose=verbose, level=level+1, log_delim=log_delim)
+        self.plot2D(field, dir_id=0, val=valx, plot_title='YZ', translation=translation, superimpose_Serpent=superimpose_Serpent, Serpent_xsize=Serpent_ysize, Serpent_ysize=Serpent_zsize, Serpent_geom_path=Serpent_paths_dirxyz[0], new_fig=False, xlim=xlim, ylim=ylim, clim=clim, field_title=field_title, colormap=colormap, verbose=verbose, level=level+1, log_delim=log_delim)
         ax4=fig.add_subplot(2,2,4, projection="3d")
-        self.plot3D(field, new_fig=False, xlim=xlim, ylim=ylim, zlim=zlim, clim=clim, field_title=field_title, colormap=colormap, view=view, sample_fraction=sample_fraction, fast=fast, force_slow=False, scatter_size=scatter_size, alpha=alpha, verbose=verbose, level=level+1, log_delim=log_delim)
-        
+        self.plot3D(field, new_fig=False, xlim=xlim, ylim=ylim, zlim=zlim, translation=translation, clim=clim, field_title=field_title, colormap=colormap, view=view, sample_fraction=sample_fraction, fast=fast, force_slow=False, scatter_size=scatter_size, alpha=alpha, verbose=verbose, level=level+1, log_delim=log_delim)
+
         if save_fig:
             if isinstance(fig_name, type(None)):
                 fig_path = f'{fig_folder}/Summary_plot_{field}{fig_suffix}.png'
@@ -566,7 +912,7 @@ class Pebble_bed:
         log_print(f'Showing Serpent plot from {plot_file_path}', verbose, level, log_delim)
         if isinstance(title, type(None)):
             title = plot_file_path
-        
+
         if new_fig:
             if not isinstance(fig_size, type(None)):
                 plt.figure(figsize=fig_size)
@@ -584,7 +930,7 @@ class Pebble_bed:
 
         if save_fig:
             if isinstance(fig_name, type(None)):
-                fig_path = f'{fig_folder}/Serpent_plot_{os.path.basename(plot_file_path)}{fig_suffix}.png'
+                fig_path = f'{fig_folder}/Serpent_plot_{os.path.splitext(os.path.basename(plot_file_path))[0]}{fig_suffix}.png'
             else:
                 fig_path = f'{fig_folder}/{fig_name}{fig_suffix}.png'
             log_print(f'Saving figure in {fig_path}', verbose, level+1, log_delim)
@@ -595,27 +941,27 @@ class Pebble_bed:
 
     #### WRITING ####
 
-    def write_fields(self, path, fields='all', indices='all', separate_fields=False, separate_indices=False, sep ='\t', include_headers=True, include_indices=True, prefix='data', float_format='%.4E', verbose=True, level=0, log_delim='  '):
+    def write_fields(self, path, fields='all', indices='all', separate_fields=False, separate_indices=False, sep =',', include_headers=True, include_indices=True, prefix='data', file_type='.csv', float_format='%.4E', verbose=True, level=0, log_delim='  '):
         subpbed = self.extract(fields=fields, indices=indices)
         if separate_fields:
             for field in subpbed.data.columns:
                 if separate_indices:
                     for index in subpbed.data.index:
-                        name = f'{path}/{prefix}_index_{index}_field_{field}.txt'
+                        name = f'{path}/{prefix}_index_{index}_field_{field}{file_type}'
                         subpbed.data.loc[index, field].to_csv(name, header=include_headers, index=include_indices, sep=sep, float_format=float_format)
                 else:
-                    name = f'{path}/{prefix}_field_{field}.txt'
+                    name = f'{path}/{prefix}_field_{field}{file_type}'
                     subpbed.data[field].to_csv(name, header=include_headers, index=include_indices, sep=sep, float_format=float_format)
         else:
             if separate_indices:
                 for index in subpbed.data.index:
-                    name = f'{path}/{prefix}_index_{index}.txt'
+                    name = f'{path}/{prefix}_index_{index}{file_type}'
                     subpbed.data.loc[index].to_csv(name, header=include_headers, index=include_indices, sep=sep, float_format=float_format)
             else:
-                name = f'{path}/{prefix}.txt'
-                subpbed.data.to_csv(name, header=include_headers, index=include_indices, sep=sep, float_format=float_format)    
+                name = f'{path}/{prefix}{file_type}'
+                subpbed.data.to_csv(name, header=include_headers, index=include_indices, sep=sep, float_format=float_format)
 
-        
+
     #### DOMAIN DECOMPOSITION ####
 
     def decompose_in_domains(self, n_domains_list, decomposition_types, filling_domain=None, center=None, shift_sectors=0, keep_subdomains=True, verbose=True, level=0, log_delim='  '):
@@ -655,10 +1001,10 @@ class Pebble_bed:
                 sub_pbed.decompose_in_domains_simple(n_domains, decomposition_type, filling_domain, ctr, shift_sector, idle=False, verbose=verbose, level=level+1, log_delim=log_delim)
                 domain_id[list(sub_pbed.data.id)] = sub_pbed.data.domain_id
             self.data[f'domain_id_{i_decomp}'] = np.array(domain_id)
-            
+
         self.data = self.data.sort_values([f'domain_id_{i_decomp}' for i_decomp in range(N_levels)])
         self.data.domain_id = self.data.set_index([f'domain_id_{i_decomp}' for i_decomp in range(N_levels)]).index.factorize()[0]
-        
+
         self.data = self.data.sort_values('id')
         are_ghosts = self.is_ghost()
         self.data.loc[are_ghosts, 'domain_id'] = np.nan
@@ -675,7 +1021,7 @@ class Pebble_bed:
 
         if isinstance(filling_domain, type(None)):
             filling_domain = n_domains-1
-        
+
         if not isinstance(center, type(None)):
             self.center = center
             self.process_data(calculate_center=False, verbose=verbose, level=level+1, log_delim=log_delim)
@@ -686,13 +1032,13 @@ class Pebble_bed:
         target_npebbles_domains = np.floor((len(self.data)- self.N_ghosts)/ n_domains).astype(int)
 
         if decomposition_type in ['0', 'random', 'n']:
-            
+
             log_print(f'Decomposing pebbles randomly in {n_domains} domains', verbose, level, log_delim)
             domain_id = []
             i_pebble = 0
             are_ghosts = self.is_ghost()
             for i_domain in range(n_domains):
-                cnt_domain = 0 
+                cnt_domain = 0
                 while cnt_domain < target_npebbles_domains:
                     if not are_ghosts[i_pebble]:
                         domain_id.append(i_domain)
@@ -700,7 +1046,7 @@ class Pebble_bed:
                     else:
                         domain_id.append(np.nan)
                     i_pebble += 1
-            
+
             # Handles last domain
             cnt_extra = 0
             while len(domain_id) < len(self.data):
@@ -708,18 +1054,18 @@ class Pebble_bed:
                 cnt_extra += 1
             if cnt_extra > 0:
                 log_print(f'{cnt_extra} extra pebbles in domain {filling_domain}', verbose, level+1, log_delim)
-            
+
             # Shuffles
             np.random.shuffle(domain_id)
 
         elif decomposition_type in ['1', 'index', 'i', 'id']:
-            
+
             log_print(f'Decomposing pebbles by index in {n_domains} domains', verbose, level, log_delim)
             domain_id = []
             i_pebble = 0
             are_ghosts = self.is_ghost()
             for i_domain in range(n_domains):
-                cnt_domain = 0 
+                cnt_domain = 0
                 while cnt_domain < target_npebbles_domains:
                     if not are_ghosts[i_pebble]:
                         domain_id.append(i_domain)
@@ -735,16 +1081,16 @@ class Pebble_bed:
                 cnt_extra += 1
             if cnt_extra > 0:
                 log_print(f'{cnt_extra} extra pebbles in domain {filling_domain}', verbose, level+1, log_delim)
-            
+
         elif decomposition_type in ['2', 'sectors', 'sector', 's']:
-            
+
             log_print(f'Decomposing pebbles by azimuthal sectors in {n_domains} domains', verbose, level, log_delim)
             if shift_sector > 0:
                 log_print(f'Shifting sectors by {shift_sector} degree', verbose, level+1, log_delim)
-            
+
             if 'azim_angle' not in self.data.columns:
                 self.process_data(verbose, level+1, log_delim)
-            
+
             # Shift
             angles = self.data.azim_angle - shift_sector
             angles[angles < 0] += 360
@@ -754,7 +1100,7 @@ class Pebble_bed:
             i_pebble = 0
             are_ghosts = self.is_ghost()
             for i_domain in range(n_domains):
-                cnt_domain = 0 
+                cnt_domain = 0
                 while cnt_domain < target_npebbles_domains:
                     if not are_ghosts[angles.index[i_pebble]]:
                         domain_id[angles.index[i_pebble]] = i_domain
@@ -762,7 +1108,7 @@ class Pebble_bed:
                     else:
                         domain_id[angles.index[i_pebble]] = np.nan
                     i_pebble += 1
-                    
+
             # Handles last domain
             domain_id = np.array(domain_id)
             negative_id = domain_id < 0
@@ -772,18 +1118,18 @@ class Pebble_bed:
                 log_print(f'{cnt_extra} extra pebbles in domain {filling_domain}', verbose, level+1, log_delim)
 
         elif decomposition_type in ['4', 'radial', 'rad', 'r']:
-            
+
             log_print(f'Decomposing pebbles by radial zones in {n_domains} domains', verbose, level, log_delim)
 
             if 'r_dist' not in self.data.columns:
                 self.process_data(verbose, level+1, log_delim)
-        
+
             radial_dist = self.data.r_dist.sort_values()
             domain_id = np.ones((len(radial_dist)))*-1
             i_pebble = 0
             are_ghosts = self.is_ghost()
             for i_domain in range(n_domains):
-                cnt_domain = 0 
+                cnt_domain = 0
                 while cnt_domain < target_npebbles_domains:
                     if not are_ghosts[radial_dist.index[i_pebble]]:
                         domain_id[radial_dist.index[i_pebble]] = i_domain
@@ -799,17 +1145,17 @@ class Pebble_bed:
             domain_id[negative_id] = filling_domain
             if cnt_extra > 0:
                 log_print(f'{cnt_extra} extra pebbles in domain {filling_domain}', verbose, level+1, log_delim)
-        
+
         elif decomposition_type in ['5', 'axial', 'ax', 'a']:
-            
-            log_print(f'Decomposing pebbles by axial zones in {n_domains} domains', verbose, level, log_delim)        
+
+            log_print(f'Decomposing pebbles by axial zones in {n_domains} domains', verbose, level, log_delim)
 
             axial_dist = self.data.z.sort_values()
             domain_id = np.ones((len(axial_dist)))*-1
             i_pebble = 0
             are_ghosts = self.is_ghost()
             for i_domain in range(n_domains):
-                cnt_domain = 0 
+                cnt_domain = 0
                 while cnt_domain < target_npebbles_domains:
                     if not are_ghosts[axial_dist.index[i_pebble]]:
                         domain_id[axial_dist.index[i_pebble]] = i_domain
@@ -825,21 +1171,21 @@ class Pebble_bed:
             domain_id[negative_id] = filling_domain
             if cnt_extra > 0:
                 log_print(f'{cnt_extra} extra pebbles in domain {filling_domain}', verbose, level+1, log_delim)
-        
+
         elif decomposition_type in ['6', 'spherical', 'spheric', 'sphere', 'sph', 'o']:
 
-            log_print(f'Decomposing pebbles by spherical zones in {n_domains} domains', verbose, level, log_delim)        
+            log_print(f'Decomposing pebbles by spherical zones in {n_domains} domains', verbose, level, log_delim)
 
             if 'dist' not in self.data.columns:
                 self.process_data(verbose, level+1, log_delim)
-        
+
 
             dist = self.data.dist.sort_values()
             domain_id = np.ones((len(dist)))*-1
             i_pebble = 0
             are_ghosts = self.is_ghost()
             for i_domain in range(n_domains):
-                cnt_domain = 0 
+                cnt_domain = 0
                 while cnt_domain < target_npebbles_domains:
                     if not are_ghosts[dist.index[i_pebble]]:
                         domain_id[dist.index[i_pebble]] = i_domain
@@ -855,7 +1201,7 @@ class Pebble_bed:
             domain_id[negative_id] = filling_domain
             if cnt_extra > 0:
                 log_print(f'{cnt_extra} extra pebbles in domain {filling_domain}', verbose, level+1, log_delim)
-        
+
         self.data['domain_id'] = domain_id
 
 
@@ -867,8 +1213,6 @@ class Pebble_bed:
             log_print(f'Count in domains: {cnt_domains}', verbose, level+1, log_delim)
 
         log_print(f'Done.', verbose, level, log_delim, end_block=True)
-
-        
 
 
 def log_print(text, printing=True, level=0, log_delim='  ', line_limit=None, end_block=False, end_block_log_delim='\n', returning=True):
@@ -900,73 +1244,161 @@ def log_print(text, printing=True, level=0, log_delim='  ', line_limit=None, end
 
     if end_block and level==0:
         s += end_block_log_delim
-    if printing:      
+    if printing:
         print(s)
-    if returning: 
+    if returning:
         return s
 
-#  if __name__ == '__main__':
-    # verbose=True
+def find_matching(string, list_strings, infer_if_incorrect=True, lower_ok=True, cutoff=0.4):
+    list_strings = list(list_strings)
+    if lower_ok:
+        keys = [key.lower() for key in list_strings]
+        search_parameter = string.lower()
+    else:
+        keys = [key for key in list_strings]
+        search_parameter = str(string)
+
+    if search_parameter not in keys:
+        if infer_if_incorrect:
+            match_string = difflib.get_close_matches(search_parameter, keys, cutoff=cutoff, n=100000)
+            if len(match_string) == 0:
+                return None
+            match_indices = [keys.index(key) for key in match_string]
+            real_matches = [list_strings[i] for i in match_indices]
+            print(f'String {string} not found, close matches are: {real_matches}. Picking the first one.')
+            string = real_matches[0]
+        else:
+            return None
+    else:
+        index = keys.index(string.lower())
+        string = list_strings[index]
+    return string
+
+def errorbar(x, y, yerr, steps=False, fancy=True, label=None, alpha=0.3):
+    if not fancy:
+        if steps:
+            plt.errorbar(x, y, yerr, drawstyle='steps', label=label)
+        else:
+            plt.errorbar(x, y, yerr, label=label)
+    else:
+        if isinstance(label, type(None)):
+            label='Values'
+
+        if steps:
+            plt.plot(x, y, drawstyle='steps', label=label, zorder=1)
+            plt.fill_between(x, y-yerr, y+yerr, step="pre", label='Error', alpha=alpha, color=plt.gca().lines[-1].get_color())
+        else:
+            plt.plot(x, y, label=label, zorder=1)
+            plt.fill_between(x, y-yerr, y+yerr, label='Error', alpha=alpha, color=plt.gca().lines[-1].get_color())
+        plt.legend()
+
+def swap_axis(ax):
+    xlabel, ylabel = ax.get_xlabel(), ax.get_ylabel()
+    plt.xlabel(ylabel)
+    plt.ylabel(xlabel)
+
+    xlim, ylim = ax.get_xlim(),  ax.get_ylim()
+    plt.xlim(ylim)
+    plt.ylim(xlim)
+    for lines in ax.get_lines():
+        try:
+            iter(lines)
+        except:
+            lines = [lines]
+        for line in lines:
+            xdata, ydata = line.get_xdata(), line.get_ydata()
+            line.set_xdata(ydata)
+            line.set_ydata(xdata)
+            line.axes.autoscale_view()
+
+    return ax
+
+if __name__ == '__main__':
+    file = '/home/yryves/serpent_cases/domain_decomposition_dvlpt/test_stl/data_0.csv'
+    verbose=True
+    pbed = Pebble_bed()
+    pbed.read_datafile(file, verbose=verbose)
+    #pbed.plot_distribution('burnup', normalized=True, save_fig=True)
+    pbed.plot_res('anakeff', save_fig=True, which_columns=0, which_columns_errors=1, res_file_path='/home/yryves/serpent_cases/domain_decomposition_dvlpt/test_stl/wrk_Serpent/input_res.m')
+    #pbed.plot1D_mean('burnup', fieldx='z', save_fig=True)
+    #pbed.plot1D_mean('power', error_field='power_err', save_fig=True)
+    #pbed.plot1D_sum('power', error_field='power_err', save_fig=True)
+    pbed.data['power_contribution'] = pbed.data.power/pbed.data.power.sum()
+    pbed.plot1D_sum('power_contribution', fieldx='z', bins=10000, cumulative=True, save_fig=True) 
+    ax = swap_axis(plt.gca())
     # folder = "/home/yryves/serpent_cases/test_larger/"
     # pbed_path = folder + "fpb_pos"
     # det0_path = folder + "input_det0.m"
-    # dep_path  = folder + "input_dep.m"   
+    # dep_path  = folder + "input_dep.m"
     # plotxy_path  = folder + "input_geom3.png"
     # plotyz_path  = folder + "input_geom4.png"
     # R = 80
     # H = 190
     # dd=True
-    # fuel_material='fuel' 
+    # fuel_material='fuel'
     # pbed = Pebble_bed()
-    # pbed.read_file(pbed_path, verbose=verbose)   
+    # pbed.read_file(pbed_path, verbose=verbose)
     # dz = 10
     # ori_r = np.array(pbed.data.r)
     # for i in range(10):
         # pbed.data.z += dz
         # pbed.data.loc[pbed.data.z + ori_r > 150, "z"] -= (150-40)
         # pbed.data.loc[pbed.data.z - ori_r < 40, "r"] = 0
-        # pbed.data.loc[pbed.data.z - ori_r >= 40, "r"] = ori_r[pbed.data.z - ori_r >= 40] 
+        # pbed.data.loc[pbed.data.z - ori_r >= 40, "r"] = ori_r[pbed.data.z - ori_r >= 40]
     # plt.figure()
     # ax= pbed.show_Serpent_plot(plotxy_path, xlim=[-R,R], ylim=[-R,R], verbose=verbose) #, tol=1000)
     # plt.show()
-# 
+#
     # plt.figure()
     # ax= pbed.show_Serpent_plot(plotyz_path, xlim=[-R,R], ylim=[0,H], verbose=verbose) #, tol=1000)
     # plt.show()
     # ax= pbed.plot2D(field='z', verbose=verbose) #, tol=1000)
-    # plt.show()   
+    # plt.show()
     # pbed.read_detector(det0_path, which_dets='all', verbose=verbose)
     # ax= pbed.plot2D(field='id', verbose=verbose) #, tol=1000)
-    # plt.show()   
+    # plt.show()
     # pbed.read_depletion(dep_path, material_name=fuel_material, dd=dd, fields='all', verbose=verbose)
     # ax = pbed.plot3D(force_slow=True, sample_fraction=1, field='id', verbose=verbose)
     # plt.show()
-    # error    
-    # pbed.clip('rdist', 150, +1).clip('rdist', 155, -1) 
+    # error
+    # pbed.clip('rdist', 150, +1).clip('rdist', 155, -1)
     # plt.figure()
     # ax = pbed.plot2D(field='dist', field_title='Distance to center')
-    # plt.show() 
+    # plt.show()
     # plt.figure()
     # ax= pbed.plot2D(field='r_dist', field_title='Radial distance to center')
-    # plt.show() 
+    # plt.show()
 
-verbose=True
-folder = "/home/yryves/serpent_cases/test_larger/"
-pbed_path = folder + "fpb_pos"
-pbed = Pebble_bed()
-pbed.read_file(pbed_path, verbose=verbose)  
+# verbose=True
+# folder = "/home/yryves/serpent_cases/test_larger/"
+# pbed_path = folder + "fpb_pos"
+# pbed = Pebble_bed()
+# pbed.read_file(pbed_path)
+# pbed.decompose_in_domains_simple(5, 'axial')
+# pbed.add_field('angle', np.arctan2(pbed.data.z-pbed.center[2], pbed.data.r_dist))
+# pbed.plot2D('angle', dir_id='x', val=0, fig_size=(3,5))
+# pbed.plot2D('domain_id', dir_id='x', val=0, fig_size=(3,5))
 
-for t in ['as', 'ar', 'si', 'nn', 'ii', 'ao']:
-    pbed.decompose_in_domains([2,4], t, verbose=False)
-    pbed.plot3D('domain_id', fig_size=(6,8), scatter_size=50, save_fig=True, fig_suffix=f'_{t}', field_title=f'DD: {t}', verbose=False)
-    plt.show()
 
-for t in ['asr', 'aro', 'sir', 'nao', 'rao']:
-    pbed.decompose_in_domains([2,2,2], t, verbose=False)
-    pbed.plot3D('domain_id', fig_size=(6,8), scatter_size=50, save_fig=True, fig_suffix=f'_{t}', field_title=f'DD: {t}', verbose=False)
-    plt.show()
 
-for t in ['asro']:
-    pbed.decompose_in_domains([2,2,2,2], t, verbose=False)
-    pbed.plot3D('domain_id', fig_size=(6,8), scatter_size=50, save_fig=True, fig_suffix=f'_{t}', field_title=f'DD: {t}', verbose=False)
-    plt.show()
+# pbed.decompose_in_domains(4, 'r', verbose=False)
+# pbed.plot3D('domain_id', fig_size=(6,8), scatter_size=50, save_fig=True, fig_suffix=f'_o', field_title=f'DD: {t}', verbose=False)
+# plt.show()
+
+# pbed.decompose_in_domains(6, 'o', verbose=False)
+# pbed.plot3D('domain_id', fig_size=(6,8), scatter_size=50, save_fig=True, fig_suffix=f'_o', field_title=f'DD: {t}', verbose=False)
+# plt.show()
+
+# pbed.decompose_in_domains([2, 6], 'rs', verbose=False)
+# pbed.plot3D('domain_id', fig_size=(6,8), scatter_size=50, save_fig=True, fig_suffix=f'_rs', field_title=f'DD: {t}', verbose=False)
+# plt.show()
+
+# pbed.decompose_in_domains([4, 4], 'as', shift_sectors=[90/4*i for i in range(4)], verbose=False)
+# pbed.plot3D('domain_id', fig_size=(6,8), scatter_size=50, save_fig=True, fig_suffix=f'_as', field_title=f'DD: {t}', verbose=False)
+# plt.show()
+
+# pbed.decompose_in_domains(8, 's', center=[[40,0,0]], verbose=False)
+# pbed.plot3D('domain_id', fig_size=(6,8), scatter_size=50, save_fig=True, fig_suffix=f'_s_shift', field_title=f'DD: {t}', verbose=False)
+# plt.show()
+
+#pbed.clip(0, direction=-1).plot3D('angle', alpha=0.6, save_fig=True, fig_size=(3,5), xlim=[-40,40])
